@@ -30,17 +30,18 @@ struct status_node {
 };
 
 struct status_list {
-  struct status_node status[MAX_RANK + 1][MAX_PAGE_NUM];
+  struct status_node status[MAX_RANK + 1][MAX_PAGE_NUM];//1 base rank
 };
 
 struct buddy_list free_list[MAX_RANK + 1], alloc_list[MAX_RANK + 1];
+
 struct status_list page_status;
 
 //--------------------------------for buddy
 // node---------------------------------------------------
 struct buddy_node *init_buddy_node(int rank, int order, void *start_addr) {
   struct buddy_node *ptr =
-      (struct buddy_node *)malloc(sizeof(struct buddy_node));
+      (struct buddy_node *) malloc(sizeof(struct buddy_node));
   ptr->rank = rank;
   ptr->order = order;
   ptr->start_addr = start_addr;
@@ -117,6 +118,15 @@ struct buddy_node *get_self_ptr(int rank, int order) {
 void *start_ptr;
 int page_num, max_rank;
 
+int8_t if_buddy_valid(int rank, int order) {
+  if (rank > max_rank || rank < 1)
+    return 0;
+  else {
+    int max_order = page_num / (1 << (rank - 1));
+    if ((order ^ 1) <= max_order) { return 1; } else { return 0; }
+  }
+}
+
 struct buddy_node *get_buddy_node(int wanted_rank) {
   if (wanted_rank > max_rank)
     return NULL;
@@ -144,8 +154,13 @@ struct buddy_node *get_buddy_node(int wanted_rank) {
 }
 
 void return_buddy_node(int rank, int order) {
-  if (rank < 1)
+  if (rank == max_rank){
+    struct buddy_node *ptr = get_self_ptr(rank, order);
+    remove_certain(&alloc_list[rank], ptr);
+    set_status(rank, order, 0);
+    insert_front(&free_list[rank], ptr);
     return;
+  }
   struct buddy_node *ptr = get_self_ptr(rank, order);
   remove_certain(&alloc_list[rank], ptr);
   set_status(rank, order, 0);
@@ -156,25 +171,29 @@ void return_buddy_node(int rank, int order) {
     struct buddy_node *buddy_ptr = get_buddy_ptr(rank, order);
     remove_certain(&free_list[rank], buddy_ptr);
     set_status(rank, order ^ 1, 0);
-    //    return_buddy_node(rank-1, )
+    return_buddy_node(rank + 1, order / 2);
   }
 }
 
 int init_page(void *p, int pgcount) {
   start_ptr = p;
   page_num = pgcount;
-  max_rank = 0;
-  while (1 << max_rank < page_num && max_rank < MAX_RANK) {
+  max_rank = 1;
+  while (1 << (max_rank - 1) < page_num && max_rank <= MAX_RANK) {
     max_rank++;
   }
 
-  for (int i = max_rank; i > 0; i++) {
-    int buddy_page_size = 1 << i; //一个buddy node里有几个页
+  for (int i = max_rank; i > 0; i--) {
+    int buddy_page_size = 1 << (i - 1); //一个buddy node里有几个页
     int buddy_page_mem_size = buddy_page_size * MEM_PAGE_SIZE;
     int buddy_node_num = page_num / buddy_page_size;
-    if (buddy_node_num * buddy_page_size < page_num) {
-      printf("[error] wrong page size\n");
-    }
+    // if (buddy_node_num * buddy_page_size < page_num) {
+    //   printf("[error] wrong page size\n");
+    //   printf("[error] buddy_node_num = %d\n", buddy_node_num);
+    //   printf("[error] buddy_page_size = %d\n", buddy_page_size);
+    //   printf("[error] page_num = %d\n", page_num);
+    //   exit(0);
+    // }
     void *tmp_ptr = start_ptr;
 
     for (int j = 0; j < buddy_node_num; j++) {
@@ -182,33 +201,68 @@ int init_page(void *p, int pgcount) {
       init_status(i, j, buddy_ptr);
       tmp_ptr += buddy_page_mem_size;
     }
-    insert_front(&free_list[max_rank], get_self_ptr(max_rank, 0));
   }
+
+  insert_front(&free_list[max_rank], get_self_ptr(max_rank, 0));
 
   return OK;
 }
 
 void *alloc_pages(int rank) {
-  if (rank < 1 || rank > MAX_RANK)
-    return (void *)(-EINVAL);
+  if (rank < 1 || rank > max_rank)
+    return (void *) (-EINVAL);
   struct buddy_node *ptr = get_buddy_node(rank);
   if (ptr == NULL)
-    return (void *)(-ENOSPC);
-  return ptr;
+    return (void *) (-ENOSPC);
+  return ptr->start_addr;
+}
+
+int query_alloc_rank(void *p) {
+  void *pointed_addr = p;
+  int rank = 0;
+  int order = 0;
+  for (rank = 1; rank < max_rank; rank++) {
+    int buddy_page_size = 1 << (rank - 1);
+    int buddy_page_mem_size = buddy_page_size * MEM_PAGE_SIZE;
+    int tmp = (int) (pointed_addr - start_ptr) % buddy_page_mem_size;
+    if (tmp != 0) {
+      rank = rank - 1;
+      break;
+    }
+    order = (int) (pointed_addr - start_ptr) / buddy_page_mem_size;
+    if (get_status(rank, order) == 1) {
+      break;
+    }
+  }
+  return rank;
 }
 
 int return_pages(void *p) {
   if (p == NULL || p < start_ptr || p > start_ptr + page_num * MEM_PAGE_SIZE)
     return (-EINVAL);
-  struct buddy_node *ptr = (struct buddy_node *)p;
-  int rank = ptr->rank;
-  int order = ptr->order;
+  int rank = query_alloc_rank(p);
+  int order = (int) (p - start_ptr) / ((1 << (rank - 1)) * MEM_PAGE_SIZE);
+
   if (get_status(rank, order) == 0)
     return (-EINVAL);
-
-  return OK;
+  else {
+    return_buddy_node(rank, order);
+    return OK;
+  }
 }
 
-int query_ranks(void *p) { return OK; }
+int query_ranks(void *p) {
+  if (p == NULL || p < start_ptr || p > start_ptr + page_num * MEM_PAGE_SIZE)
+    return (-EINVAL);
+  int rank = query_alloc_rank(p);
+  return rank;
+}
 
-int query_page_counts(int rank) { return OK; }
+int query_page_counts(int rank) {
+  if (rank < 1 || rank > max_rank)
+    return (-EINVAL);
+  int buddy_page_size = 1 << (rank - 1);
+  int total_page = page_num / buddy_page_size;
+  int free_num = free_list[rank].cnt;
+  return free_num;
+}
